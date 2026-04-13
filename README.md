@@ -1,6 +1,6 @@
 # Benchmark Digest
 
-追踪 21+ 个 AI/ML benchmark 排行榜，通过 HuggingFace API 抓取分数 → SQLite 存储 → 三步隔离 LLM 反思生成中文周报。
+追踪 21+ 个 AI/ML benchmark 排行榜，通过 HuggingFace API 抓取分数、SQLite 存储，由 Hermes cron job 编排三步隔离反思流水线（Draft → Critique → Refine）生成高质量中文周报。
 
 ## 架构
 
@@ -45,7 +45,7 @@
 ```
 ~/.hermes/hermes-agent/benchmark-digest/
 ├── benchmark_fetch.py      # 抓取层：HuggingFace parquet + leaderboard API
-├── digest_generate.py      # 摘要层：数据加载 + 三步 Prompt 模板
+├── digest_generate.py      # 摘要层：数据加载 + 三步 Prompt 模板输出
 ├── db.py                   # 数据层：共享 DB schema + 工具函数
 ├── data/
 │   └── benchmarks.db       # SQLite 数据库
@@ -56,16 +56,13 @@
 └── benchmark_digest.py     # Cron 包装：调用 digest_generate.py query
 ```
 
-## 依赖
+依赖：pandas + pyarrow（`pip install pandas pyarrow`）
 
-- Python 3.9+
-- pandas + pyarrow（`pip install pandas pyarrow`）
+## 追踪的内容
 
-## 数据源
+7 大类、21+ 个 benchmark，两个数据源。
 
-### 1. OpenEvals/leaderboard-data（聚合 Parquet）
-
-HuggingFace 官方聚合数据集，一个 Parquet 文件包含 105 个模型 × 11 个 benchmark 的分数。
+**数据源 1：OpenEvals/leaderboard-data（聚合 Parquet，105 模型 × 11 Benchmark）**
 
 | Benchmark | 类别 | 有数据的模型数 | 分数范围 |
 |-----------|------|---------------|---------|
@@ -81,33 +78,40 @@ HuggingFace 官方聚合数据集，一个 Parquet 文件包含 105 个模型 ×
 | SWE-bench Verified | code | 25 | 37.4 - 76.4 |
 | TerminalBench | code | 21 | 13.0 - 52.5 |
 
-### 2. HuggingFace Dataset Leaderboard API（逐 Benchmark）
-
-直接调 `https://huggingface.co/api/datasets/{id}/leaderboard`，获取最新排名。
+**数据源 2：HuggingFace Dataset Leaderboard API（逐 Benchmark）**
 
 | Benchmark | HF Dataset | 条目数 |
 |-----------|-----------|--------|
 | SWE-bench Verified | SWE-bench/SWE-bench_Verified | 38 |
 | MMLU-Pro | TIGER-Lab/MMLU-Pro | 29 |
 
+**7 大类别：** reasoning, multimodal, agent, code, factuality, preference, domain
+
+当前数据库：280 个分数，13 个快照，31 个 benchmark（其中 13 个有数据），1 篇摘要。
+
 ## 核心文件说明
 
 ### benchmark_fetch.py
 
-从 HuggingFace 抓取 benchmark 分数，存入 SQLite。
+从 HuggingFace 抓取 benchmark 分数，存入 SQLite。需要 pandas + pyarrow。
+
+**命令：**
 
 | 命令 | 说明 |
 |------|------|
-| `init` | 初始化 benchmark 注册表 |
-| `fetch` | 抓取所有数据源 |
+| `init` | 初始化 benchmark 注册表（21+ benchmark 元数据） |
+| `fetch` | 抓取所有数据源（parquet + API） |
 | `fetch --source hf` | 只抓 OpenEvals parquet |
 | `fetch --source api` | 只抓 HF leaderboard API |
+| `fetch --source all` | 抓取所有数据源（默认） |
 | `query [days]` | 查询 benchmark 数据，输出 JSON |
 | `stats [days]` | 统计信息 |
 
 ### digest_generate.py
 
-数据加载 + 三步 Prompt 模板输出。不调用 LLM。
+数据加载 + 三步 Prompt 模板输出。不调用 LLM，LLM 调用由 Hermes cron agent 通过 delegate_task 完成。
+
+**命令：**
 
 | 命令 | 说明 |
 |------|------|
@@ -115,19 +119,51 @@ HuggingFace 官方聚合数据集，一个 Parquet 文件包含 105 个模型 ×
 | `save-summary [--period weekly] [--focus default]` | 从 stdin 保存摘要到 DB |
 | `stats` | 简要统计 |
 
+**query 输出 JSON 结构：**
+```json
+{
+  "meta": { "days", "date", "score_count", "benchmark_count" },
+  "scores": { "按 benchmark 分组的分数数据" },
+  "prompts": {
+    "draft": "完整的初稿 Prompt（数据已嵌入）",
+    "critique_template": "审稿模板（{draft} 占位符）",
+    "refine_template": "精修模板（{draft} + {critique} 占位符）"
+  }
+}
+```
+
 ### db.py
 
-共享 DB schema + 工具函数（upsert_score, save_snapshot, query 等）。
+共享 DB schema + 工具函数。被 benchmark_fetch.py 和 digest_generate.py 共同引用。
+
+**主要函数：**
+
+| 函数 | 说明 |
+|------|------|
+| `get_or_create_benchmark` | 获取或创建 benchmark 记录 |
+| `upsert_score` | 插入/更新模型分数 |
+| `save_snapshot` | 保存排行榜快照（top models JSON） |
+| `save_summary` | 保存生成的摘要 |
+| `query_recent_scores` | 查询近期分数 |
+| `query_benchmarks` | 查询 benchmark 列表 |
+| `query_latest_snapshots` | 查询最新快照 |
+| `get_subscribers` | 获取订阅者列表 |
 
 ## 三步隔离反思设计
 
-| 步骤 | Subagent | 输入 | 输出 |
-|------|----------|------|------|
-| Draft | #1 | Benchmark 数据 + 排名 + 分析指令 | 初稿 |
-| Critique | #2 | 只有初稿 | 审稿意见 + A/B/C 评分 |
-| Refine | #3 | 初稿 + 审稿意见 | 终稿 |
+核心思想：审稿人看不到原始数据，只能评估摘要质量。
 
-## 数据库结构（5 张表）
+| 步骤 | Subagent | 输入 | 输出 | 隔离 |
+|------|----------|------|------|------|
+| Draft | #1 | Benchmark 数据 + 排名 + 分析指令 | 初稿 | 看得到原始数据 |
+| Critique | #2 | 只有初稿 | 审稿意见 + A/B/C 评分 | 看不到原始数据 |
+| Refine | #3 | 初稿 + 审稿意见 | 终稿 | 看不到原始数据 |
+
+每个 subagent 通过 Hermes `delegate_task` 创建，天然上下文隔离。
+
+## 数据库结构
+
+SQLite（`data/benchmarks.db`），5 张表：
 
 | 表 | 说明 |
 |----|------|
@@ -141,7 +177,7 @@ HuggingFace 官方聚合数据集，一个 Parquet 文件包含 105 个模型 ×
 
 | Job | 时间 (PST) | 说明 |
 |-----|-----------|------|
-| Benchmark Score Fetch | 周一、四 10:00 | 抓取 HuggingFace 分数 |
+| Benchmark Score Fetch | 周一、四 10:00 | 抓取 HuggingFace 分数，存入 DB |
 | Benchmark Weekly Digest | 周日 20:00 | 三步反思生成周报，保存到 DB，发到 Telegram |
 
 ## 手动使用
@@ -158,6 +194,9 @@ python3 benchmark_fetch.py fetch
 # 只抓 HuggingFace parquet
 python3 benchmark_fetch.py fetch --source hf
 
+# 只抓 leaderboard API
+python3 benchmark_fetch.py fetch --source api
+
 # 查看统计
 python3 benchmark_fetch.py stats
 python3 digest_generate.py stats
@@ -170,19 +209,19 @@ python3 digest_generate.py query --days 7
 
 从 OpenClaw workspace 迁移而来。主要改动：
 
-- 数据源从 LiveBench/LMArena 等不稳定 API 改为 HuggingFace 官方数据
+- 数据源从 LiveBench/LMArena/GAIA 等不稳定 API 改为 HuggingFace 官方数据（原 fetcher 全部返回 0 条数据）
   - OpenEvals/leaderboard-data parquet: 105 模型 × 11 benchmark
   - HF dataset leaderboard API: SWE-bench, MMLU-Pro
 - 首次抓取即获得 280 个数据点（原来 0 个）
 - 新增 `digest_generate.py`（三步 Prompt 模板）
+- 新增 `db.py`（共享 DB 层，从 fetch 脚本中拆出）
 - LLM 调用由 Hermes delegate_task 完成
+- Cron 脚本必须是 .py（Hermes scheduler 固定用 Python 解释器执行）
+- Cron 脚本必须放在 `~/.hermes/scripts/`（路径校验限制）
 
 ## 已知限制
 
 - OpenEvals parquet 数据更新频率取决于 HuggingFace 团队
 - 部分 benchmark（GAIA, BrowseComp 等）在 HF 上没有公开 leaderboard API
-- 旧的 benchmark 注册表条目保留但无新数据源
-
-## License
-
-MIT
+- 旧的 benchmark 注册表条目保留但无新数据源（31 个注册，仅 13 个有数据）
+- 三步 delegate_task 串行执行，生成摘要需要几分钟
