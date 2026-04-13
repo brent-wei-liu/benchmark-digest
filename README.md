@@ -122,8 +122,10 @@
 **query 输出 JSON 结构：**
 ```json
 {
-  "meta": { "days", "date", "score_count", "benchmark_count" },
-  "scores": { "按 benchmark 分组的分数数据" },
+  "meta": { "date", "days", "total_benchmarks", "recent_scores", "categories" },
+  "benchmarks": [ "活跃的 benchmark 列表" ],
+  "snapshots": { "按 benchmark 名的最新排行榜快照" },
+  "recent_scores": [ "最近 N 天新增的分数（最多 30 条）" ],
   "prompts": {
     "draft": "完整的初稿 Prompt（数据已嵌入）",
     "critique_template": "审稿模板（{draft} 占位符）",
